@@ -267,46 +267,35 @@ class Level_3_OrderRouting(
 
 	def _check_door_state(self):
 		path_base = '[EuroSort]EuroSort/Level3/Destinations/'
-		door_path = 'Destination/Chute_Door_Status'
 
-		chutes = self._find_destinations({"$and": [{"in_service": True}]})
-		for chute in chutes:
-			destination = chute.get('_id') or chute.get('destination')
-			if not destination:
+		for dest_key, chute in list(self._destination_contents.items()):
+			if not chute.get('in_service', True):
 				continue
 
-			tag_path = '{0}{1}/{2}'.format(path_base, destination, door_path)
-			exec_path = tag_path + '.Executed'
-
+			tag_path = '{}{}/Destination/Door_Status'.format(path_base, dest_key)
 			try:
-				door_status, exec_ = [
-					qv.value for qv in system.tag.readBlocking([tag_path, exec_path])
-				]
+				door_status = bool(system.tag.readBlocking([tag_path])[0].value)
 			except Exception:
 				continue
 
-			door_status = bool(door_status)
-			exec_ = bool(exec_)
+			if not door_status:
+				continue
 
-			if (not door_status) and (not exec_):
-				self._safe_tag_write([exec_path], [True])
-				self.log_event('Routing', reason='{}: door opened'.format(destination), ibn='', destination=destination, code=16)
+			chute_info  = chute.get('chute_info') or {}
+			raise_was   = bool(chute_info.get('raise_door', False))
+			lower_was   = bool(chute_info.get('lower_door', False))
+
+			self.on_door_status(dest_key)
+
+			if raise_was:
+				self.log_event('Routing', reason='{}: door raised'.format(dest_key), ibn='', destination=dest_key, code=16)
 				if bool(chute.get('occupied')):
-					self.log_event(
-						'Routing',
-						reason='{}: items dropped on takeaway conveyor'.format(destination),
-						ibn=self._dest_get(chute, 'ibns', ''),
-						destination=destination,
-						code=19
-					)
-
-			elif door_status and exec_:
-				self._safe_tag_write([exec_path], [False])
-				self.log_event('Routing', reason='{}: door closed'.format(destination), ibn='', destination=destination, code=17)
+					self.log_event('Routing', reason='{}: items dropped on takeaway conveyor'.format(dest_key),
+					               ibn=self._dest_get(chute, 'ibns', ''), destination=dest_key, code=19)
+			elif lower_was:
+				self.log_event('Routing', reason='{}: door lowered'.format(dest_key), ibn='', destination=dest_key, code=17)
 				if bool(self._dest_get(chute, 'waiting_for_processing', False)) and bool(chute.get('occupied')):
-					self.log_event('Routing', reason='{}: waiting for processing'.format(destination), ibn='', destination=destination, code=18)
-			else:
-				self._safe_tag_write([exec_path], [False])
+					self.log_event('Routing', reason='{}: waiting for processing'.format(dest_key), ibn='', destination=dest_key, code=18)
 
 	def _check_processed_chutes_periodic(self):
 		# FIX #3: each check uses its own timestamp so neither blocks the other.
@@ -3098,28 +3087,6 @@ class Level_3_Ship_OrderRouting(
 		ready    = len(missing_ibns) == 0 and expected_cnt > 0
 		position = dest_rec.get('position', '')
 
-		# ── 5 & 6. Door sequencing ────────────────────────────────────
-		# drop_pending and door_state are set based on which physical door
-		# this chute has, matching request_batch_door_drop / request_ob_release
-		# in contents.py. The WCS layer reads Drop_Pending from the UDT tag
-		# and performs the physical action.
-		drop_pending = False
-		door_state   = None   # None means: don't overwrite, let contents.py manage it
-
-		if ready:
-			has_batch_door = chute_info.get('has_batch_door', dest_rec.get('has_batch_door', False))
-			has_front_door = chute_info.get('has_front_door', dest_rec.get('has_front_door', False))
-
-			if position == 'REAR' and has_batch_door:
-				# UC9.8 — all items in rear, raise batch door to drop to front
-				drop_pending = True
-				door_state   = 'UP'
-
-			elif has_front_door:
-				# UC2.1 — OB chute fully consolidated, open front door for discharge
-				drop_pending = True
-				door_state   = 'DOWN'
-
 		# ── Write back ────────────────────────────────────────────────
 		updates = dict(
 			ibns                        = current_ibns,
@@ -3129,13 +3096,24 @@ class Level_3_Ship_OrderRouting(
 			percent_orders_consolidated = pct,
 			oldest_order_age_sec        = age_sec,
 			ready_for_packout           = ready,
-			drop_pending                = drop_pending,
-			drop_complete               = False,
 		)
-		if door_state is not None:
-			updates['door_state'] = door_state
-
 		self.destination_update(dest_key, updates)
+
+		# ── 5 & 6. Door sequencing ────────────────────────────────────
+		# request_door_raise / request_door_lower in Contents.py set
+		# raise_door/lower_door OPC outputs and update door_state.
+		# on_door_status() clears the command when the prox fires.
+		if ready:
+			has_batch_door = dest_rec.get('has_batch_door', False)
+			has_front_door = dest_rec.get('has_front_door', False)
+
+			if position == 'REAR' and has_batch_door:
+				# UC9.8 — rear fully consolidated, raise batch door to drop to front
+				self.request_door_raise(dest_key)
+
+			elif has_front_door:
+				# UC2.1 — OB chute fully consolidated, lower front door for discharge
+				self.request_door_lower(dest_key)
 
 		# ── 7. WCS notifications ──────────────────────────────────────
 		if ready:
