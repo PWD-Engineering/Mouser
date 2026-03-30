@@ -3137,16 +3137,8 @@ class Level_3_Ship_OrderRouting(
 		(highest station to lowest, stopping at ob_chute_limit).
 		Charles implements.
 		"""
-
-		ob_cfg			= self._gp('ob_configuration') or {}
-		fill_by_order	= bool(ob_cfg.get('fill_by_order', False))
-		fill_by_item	= bool(ob_cfg.get('fill_by_item', False))
-		chute_capacity	= int(ob_cfg.get('chute_capacity', 0) or 0)
+		ob_chute_limit = int(self._gp('ob_chute_limit', 1) or 1)
 		
-		# OB chute numbers >= X are considered active/available. All others are in reserve
-		ob_chute_limit 	= int(self._gp('ob_chute_limit', 1) or 1)
-
-		# Get all eligible OB chutes
 		ob_chutes = []
 		for dest_key, rec in self._destination_contents.items():
 			if rec is None:
@@ -3154,13 +3146,13 @@ class Level_3_Ship_OrderRouting(
 			if str(rec.get('chute_type', '')).upper() != 'OB':
 				continue
 			if not self._dest_is_eligible(rec):
-				continue	
+				continue
 			ob_chutes.append((dest_key, rec))
 
 		if not ob_chutes:
 			return None
-		
-		# Sort by descending station number
+
+		# Sort OB chutes in descending order
 		def _station(item):
 			try:
 				return int(item[0].split('-')[1])
@@ -3169,30 +3161,81 @@ class Level_3_Ship_OrderRouting(
 
 		ob_chutes.sort(key=_station, reverse=True)
 
-		# Implement OB chute limits (may not be used immediately)
+		# Trim chutes available to set limit (comment out if not being used)
 		active_count  = max(0, 26 - ob_chute_limit)
 		active_chutes = ob_chutes[:active_count]
 
 		if not active_chutes:
 			return None
 
-		# Pick highest non-full OB chute
-		for dest_key, rec in active_chutes:
-			chute_info  = self._dest_info(rec)
-			order_count = int(chute_info.get('order_count_total', 0) or 0)
-			item_count  = int(chute_info.get('item_count_total',  0) or 0)
-
-			is_full = False
-			if fill_by_order and chute_capacity > 0 and order_count >= chute_capacity:
-				is_full = True
-			if fill_by_item and chute_capacity > 0 and item_count >= chute_capacity:
-				is_full = True
-
-			if not is_full:
+		# Pick highest, non-full chute
+		for dest_key, _rec in active_chutes:
+			if not self._ob_is_full(dest_key):
 				return dest_key
 
-		# If all OB chutes full, return none
+		# All active OB chutes are full
 		return None
+
+	
+	def _ob_is_full(self, dest_key):
+		"""
+		UC4.3 — Returns True if the given OB chute has reached its configured
+		capacity limit.
+
+		A chute is considered full when either (or both) are exceeded:
+		  - fill_by_order: order_count_total >= chute_capacity
+		  - fill_by_item:  item_count_total  >= chute_capacity
+		"""
+		ob_cfg         = self._gp('ob_configuration') or {}
+		fill_by_order  = bool(ob_cfg.get('fill_by_order', False))
+		fill_by_item   = bool(ob_cfg.get('fill_by_item',  False))
+		chute_capacity = int(ob_cfg.get('chute_capacity', 0) or 0)
+
+		# If no mode is enabled or the capacity is unconfigured, never full
+		if chute_capacity <= 0 or (not fill_by_order and not fill_by_item):
+			return False
+
+		rec        = self.destination_get(dest_key) or {}
+		chute_info = self._dest_info(rec)
+
+		if fill_by_order:
+			order_count = int(chute_info.get('order_count_total', 0) or 0)
+			if order_count >= chute_capacity:
+				return True
+
+		if fill_by_item:
+			item_count = int(chute_info.get('item_count_total', 0) or 0)
+			if item_count >= chute_capacity:
+				return True
+
+		return False
+
+	def _ob_assign_order(self, ibn_info):
+		"""
+		UC3.1 — Returns the OB chute dest_key for a given order, enforcing the
+		rule that an order cannot be split across multiple OB chutes.
+
+		Returns dest_key (str) or None if no OB chute is available.
+		"""
+		order_number = str(ibn_info.get('order_number') or '')
+
+		# Honor existing OB chute assignment for order
+		if order_number:
+			for dest_key, rec in self._destination_contents.items():
+				if rec is None:
+					continue
+				if str(rec.get('chute_type', '')).upper() != 'OB':
+					continue
+				if not self._dest_is_eligible(rec):
+					continue
+
+				chute_info = self._dest_info(rec)
+				orders     = chute_info.get('orders') or []
+				if order_number in orders:
+					return dest_key
+
+		# Waterfall to chute if part of order not already in a chute
+		return self._ob_select_chute()
 
 	def ob_release(self, dest_key):
 		"""UC5.1 / UC5.3 — Charles implements."""
