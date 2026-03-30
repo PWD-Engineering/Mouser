@@ -3137,7 +3137,62 @@ class Level_3_Ship_OrderRouting(
 		(highest station to lowest, stopping at ob_chute_limit).
 		Charles implements.
 		"""
-		raise NotImplementedError('Charles — _ob_select_chute (UC4.1, UC4.2)')
+
+		ob_cfg			= self._gp('ob_configuration') or {}
+		fill_by_order	= bool(ob_cfg.get('fill_by_order', False))
+		fill_by_item	= bool(ob_cfg.get('fill_by_item', False))
+		chute_capacity	= int(ob_cfg.get('chute_capacity', 0) or 0)
+		
+		# OB chute numbers >= X are considered active/available. All others are in reserve
+		ob_chute_limit 	= int(self._gp('ob_chute_limit', 1) or 1)
+
+		# Get all eligible OB chutes
+		ob_chutes = []
+		for dest_key, rec in self._destination_contents.items():
+			if rec is None:
+				continue
+			if str(rec.get('chute_type', '')).upper() != 'OB':
+				continue
+			if not self._dest_is_eligible(rec):
+				continue	
+			ob_chutes.append((dest_key, rec))
+
+		if not ob_chutes:
+			return None
+		
+		# Sort by descending station number
+		def _station(item):
+			try:
+				return int(item[0].split('-')[1])
+			except (IndexError, ValueError):
+				return 0
+
+		ob_chutes.sort(key=_station, reverse=True)
+
+		# Implement OB chute limits (may not be used immediately)
+		active_count  = max(0, 26 - ob_chute_limit)
+		active_chutes = ob_chutes[:active_count]
+
+		if not active_chutes:
+			return None
+
+		# Pick highest non-full OB chute
+		for dest_key, rec in active_chutes:
+			chute_info  = self._dest_info(rec)
+			order_count = int(chute_info.get('order_count_total', 0) or 0)
+			item_count  = int(chute_info.get('item_count_total',  0) or 0)
+
+			is_full = False
+			if fill_by_order and chute_capacity > 0 and order_count >= chute_capacity:
+				is_full = True
+			if fill_by_item and chute_capacity > 0 and item_count >= chute_capacity:
+				is_full = True
+
+			if not is_full:
+				return dest_key
+
+		# If all OB chutes full, return none
+		return None
 
 	def ob_release(self, dest_key):
 		"""UC5.1 / UC5.3 — Charles implements."""
