@@ -3248,3 +3248,57 @@ class Level_3_Ship_OrderRouting(
 	def _route_purge(self, carrier_number):
 		"""UC12.2 / UC12.3 — Bryor implements."""
 		raise NotImplementedError('Bryor — _route_purge (UC12.2, UC12.3)')
+
+	def handle_priority_escalation(self, order_number, new_status):
+		status_lower = str(new_status or '').lower().strip()
+		if status_lower not in ('mst', 'msq'):
+			return []
+
+		order_number = str(order_number or '').strip()
+		if not order_number:
+			return []
+
+		escalated = []
+
+		for dest_key, rec in list(self._destination_contents.items()):
+			if rec is None:
+				continue
+
+			chute_type = str(rec.get('chute_type', '')).upper()
+
+			# UC10.3: flag Consolidation chutes (NORMAL or HP)
+			# UC10.4: flag OB chutes
+			if chute_type not in CONSOLIDATION_CHUTE_TYPES and chute_type != 'OB':
+				continue
+
+			chute_info   = self._dest_info(rec)
+			orders_in_chute = chute_info.get('orders') or []
+			if order_number not in orders_in_chute:
+				continue
+
+			# Guard: skip if the chute is already escalated to avoid
+			# redundant tag writes on repeated WCS pushes for the same order.
+			if bool(chute_info.get('contains_priority_order', False)):
+				continue
+
+			try:
+				# Writes contains_priority_order=True and the
+				# Contains_Priority_Order UDT tag (red overlay indicator).
+				self.flag_chute_priority_escalation(dest_key)
+				self._set_chute_light_mode(dest_key, 'BLINK1')
+
+				escalated.append(dest_key)
+				self.logger.info(
+				'handle_priority_escalation: order=%s status=%s '
+				'escalated chute=%s type=%s'
+				% (order_number, new_status, dest_key, chute_type)
+				)
+
+			except Exception as e:
+				self.logger.warn(
+				'handle_priority_escalation: failed for chute=%s '
+				'order=%s: %s'
+				% (dest_key, order_number, str(e))
+				)
+
+			return escalated
