@@ -3249,14 +3249,17 @@ class Level_3_Ship_OrderRouting(
 		"""UC12.2 / UC12.3 — Bryor implements."""
 		raise NotImplementedError('Bryor — _route_purge (UC12.2, UC12.3)')
 
-	def handle_priority_escalation(self, order_number, new_status):
-		status_lower = str(new_status or '').lower().strip()
-		if status_lower not in ('mst', 'msq'):
+	def _apply_priority_escalation(self, order_number, priority, allowed_chute_types=None):
+		priority = str(priority or '').strip().upper()
+		if priority not in ('1', '2', '3', '4', '5'):
 			return []
 
 		order_number = str(order_number or '').strip()
 		if not order_number:
 			return []
+
+		if allowed_chute_types is None:
+			allowed_chute_types = ('NORMAL', 'OB')
 
 		escalated = []
 
@@ -3265,40 +3268,87 @@ class Level_3_Ship_OrderRouting(
 				continue
 
 			chute_type = str(rec.get('chute_type', '')).upper()
-
-			# UC10.3: flag Consolidation chutes (NORMAL or HP)
-			# UC10.4: flag OB chutes
-			if chute_type not in CONSOLIDATION_CHUTE_TYPES and chute_type != 'OB':
+			if chute_type not in allowed_chute_types:
 				continue
 
-			chute_info   = self._dest_info(rec)
-			orders_in_chute = chute_info.get('orders') or []
-			if order_number not in orders_in_chute:
-				continue
+			chute_info = self._dest_info(rec)
 
-			# Guard: skip if the chute is already escalated to avoid
-			# redundant tag writes on repeated WCS pushes for the same order.
 			if bool(chute_info.get('contains_priority_order', False)):
 				continue
 
+			orders_in_chute = [
+				str(o.get('order_number') or '').strip()
+				for o in (chute_info.get('orders') or [])
+				if isinstance(o, dict)
+			]
+
+			if order_number not in orders_in_chute:
+				continue
+
 			try:
-				# Writes contains_priority_order=True and the
-				# Contains_Priority_Order UDT tag (red overlay indicator).
 				self.flag_chute_priority_escalation(dest_key)
 				self._set_chute_light_mode(dest_key, 'BLINK1')
-
 				escalated.append(dest_key)
-				self.logger.info(
-				'handle_priority_escalation: order=%s status=%s '
-				'escalated chute=%s type=%s'
-				% (order_number, new_status, dest_key, chute_type)
-				)
 
 			except Exception as e:
 				self.logger.warn(
-				'handle_priority_escalation: failed for chute=%s '
-				'order=%s: %s'
-				% (dest_key, order_number, str(e))
+					'_apply_priority_escalation: failed for chute=%s order=%s: %s'
+					% (dest_key, order_number, str(e))
 				)
 
-			return escalated
+		return escalated
+
+
+	def handle_priority_escalation(self, order_number, priority):
+		"""
+		Scanner/data-point triggered priority escalation.
+		Checks both NORMAL and OB chutes.
+		"""
+		return self._apply_priority_escalation(
+			order_number,
+			priority,
+			allowed_chute_types=('NORMAL', 'OB'),
+		)
+
+
+	def _check_order_aging(self):
+		"""
+		Periodic priority scan.
+		Scans active NORMAL chute contents only.
+		"""
+		for dest_key, rec in list(self._destination_contents.items()):
+			if rec is None:
+				continue
+
+			if not self._dest_is_eligible(rec):
+				continue
+
+			chute_type = str(rec.get('chute_type', '')).upper()
+			if chute_type != 'NORMAL':
+				continue
+
+			chute_info = self._dest_info(rec)
+			orders = chute_info.get('orders') or []
+			if not orders:
+				continue
+
+			for order_rec in orders:
+				if not isinstance(order_rec, dict):
+					continue
+
+				order_number = str(order_rec.get('order_number') or '').strip()
+				priority = str(order_rec.get('priority') or '').strip().upper()
+
+				if not order_number:
+					continue
+
+				if priority not in ('1', '2', '3', '4', '5'):
+					continue
+
+				self._apply_priority_escalation(
+					order_number,
+					priority,
+					allowed_chute_types=('NORMAL',),
+				)
+
+			
