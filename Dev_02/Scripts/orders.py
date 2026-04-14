@@ -3131,115 +3131,448 @@ class Level_3_Ship_OrderRouting(
 	# Stubs (implemented elsewhere)
 	# ==================================================================
 
-	def _ob_select_chute(self):
+	#OB Helper Functions
+	def _ob_sorted_chutes(self):
 		"""
-		UC4.1 / UC4.2 — Selects the next OB chute using waterfall method
-		(highest station to lowest, stopping at ob_chute_limit).
-		Charles implements.
+		Returns all OB destinations sorted by station number ascending.
+		Position in this list (1-based) is the OB chute rank:
+		  rank 1 = lowest station (filled last in waterfall)
+		  rank N = highest station (filled first in waterfall)
 		"""
-		ob_chute_limit = int(self._gp('ob_chute_limit', 1) or 1)
-		
-		ob_chutes = []
+		ob_keys = []
 		for dest_key, rec in self._destination_contents.items():
 			if rec is None:
 				continue
 			if str(rec.get('chute_type', '')).upper() != 'OB':
 				continue
-			if not self._dest_is_eligible(rec):
-				continue
-			ob_chutes.append((dest_key, rec))
-
-		if not ob_chutes:
-			return None
-
-		# Sort OB chutes in descending order
-		def _station(item):
 			try:
-				return int(item[0].split('-')[1])
+				station = int(dest_key.split('-')[1])
 			except (IndexError, ValueError):
-				return 0
+				station = 0
+			ob_keys.append((station, dest_key))
+		ob_keys.sort(key=lambda x: x[0])
+		return ob_keys  # list of (station, dest_key), ascending
 
-		ob_chutes.sort(key=_station, reverse=True)
-
-		# Trim chutes available to set limit (comment out if not being used)
-		active_count  = max(0, 26 - ob_chute_limit)
-		active_chutes = ob_chutes[:active_count]
-
-		if not active_chutes:
-			return None
-
-		# Pick highest, non-full chute
-		for dest_key, _rec in active_chutes:
-			if not self._ob_is_full(dest_key):
-				return dest_key
-
-		# All active OB chutes are full
+	def _ob_chute_index(self, dest_key):
+		"""
+		Returns the 1-based OB chute number for the given dest_key,
+		or None if dest_key is not an OB destination.
+		Chute #1 = lowest station, chute #N = highest station.
+		"""
+		for idx, (station, dk) in enumerate(self._ob_sorted_chutes()):
+			if dk == dest_key:
+				return idx + 1
 		return None
 
+	def _ob_tag_base(self, dest_key):
+		"""
+		Returns the Ignition tag base path for the OverflowBuffer display UDT
+		that corresponds to dest_key
+		Returns None if the OB chute number cannot be determined.
+		"""
+		chute_num = self._ob_chute_index(dest_key)
+		if chute_num is None:
+			return None
+		return '[EuroSort]EuroSort/%s/OverflowBuffer/OB_Chute-%d/' % (self.name, chute_num)
+
+	def _ob_write_display_tags(self, dest_key):
+		"""
+		Writes the four UC6.2 display metrics to the OverflowBuffer/OB_Chute-N
+		UDT from the current destination_contents cache entry.
+
+		Tags written:
+		  Order_CNT              — current order count
+		  Line_CNT               — current line count
+		  percent_ItemsContained — (item_count_total / ItemCap_CNT) * 100
+		  percent_OrdersConsolid — percent_orders_consolidated from chute_info
+		"""
+		tag_base = self._ob_tag_base(dest_key)
+		if not tag_base:
+			return
+
+		dest_rec   = self.destination_get(dest_key) or {}
+		chute_info = self._dest_info(dest_rec)
+
+		order_cnt    = int(chute_info.get('order_count_total', 0) or 0)
+		line_cnt     = int(chute_info.get('line_count_total',  0) or 0)
+		item_cnt     = int(chute_info.get('item_count_total',  0) or 0)
+		pct_consolid = float(chute_info.get('percent_orders_consolidated', 0.0) or 0.0)
+
+		# Read the global item capacity ceiling from the OverflowBuffer folder
+		cap_path = '[EuroSort]EuroSort/%s/OverflowBuffer/ItemCap_CNT' % self.name
+		try:
+			cap_result = system.tag.readBlocking([cap_path])
+			item_cap   = int((cap_result[0].value or 0)) if cap_result else 0
+		except Exception:
+			item_cap = 0
+
+		pct_items = round((item_cnt / float(item_cap)) * 100.0, 2) if item_cap > 0 else 0.0
+
+		paths = [
+			tag_base + 'Order_CNT',
+			tag_base + 'Line_CNT',
+			tag_base + 'percent_ItemsContained',
+			tag_base + 'percent_OrdersConsolid',
+		]
+		values = [order_cnt, line_cnt, pct_items, pct_consolid]
+		self._safe_tag_write(paths, values)
+
 	
-	def _ob_is_full(self, dest_key):
+	# OB Functions
+	def _ob_select_chute(self):
 		"""
-		UC4.3 — Returns True if the given OB chute has reached its configured
-		capacity limit.
+		UC4.1 — Waterfall chute selection for OB routing.
 
-		A chute is considered full when either (or both) are exceeded:
-		  - fill_by_order: order_count_total >= chute_capacity
-		  - fill_by_item:  item_count_total  >= chute_capacity
+		Iterates all OB chutes from highest station to lowest and returns
+		the first eligible, non-full dest_key.  Returns None when every OB
+		chute is full or unavailable.
 		"""
-		ob_cfg         = self._gp('ob_configuration') or {}
-		fill_by_order  = bool(ob_cfg.get('fill_by_order', False))
-		fill_by_item   = bool(ob_cfg.get('fill_by_item',  False))
-		chute_capacity = int(ob_cfg.get('chute_capacity', 0) or 0)
+		sorted_chutes = self._ob_sorted_chutes()   # [(station, dest_key), ...] ascending
 
-		# If no mode is enabled or the capacity is unconfigured, never full
-		if chute_capacity <= 0 or (not fill_by_order and not fill_by_item):
-			return False
+		if not sorted_chutes:
+			self.logger.warn('_ob_select_chute: no OB destinations configured')
+			return None
 
-		rec        = self.destination_get(dest_key) or {}
+		for _station, dest_key in reversed(sorted_chutes):
+			rec = self.destination_get(dest_key)
+			if not self._dest_is_eligible(rec):
+				continue
+			if self._ob_is_full(dest_key, rec):
+				continue
+			return dest_key
+
+		self.logger.warn('_ob_select_chute: all OB chutes full or unavailable')
+		return None
+
+	def _ob_is_full(self, dest_key, rec=None):
+		"""
+		UC4.3 — Returns True when the OB chute has reached capacity.
+
+		Capacity mode is controlled by the ob_configuration permissive
+		Both flags may be True simultaneously; either condition marks the
+		chute full.
+		"""
+		if rec is None:
+			rec = self.destination_get(dest_key)
+		if rec is None:
+			return True  # unknown destination — treat as full to avoid routing there
+
 		chute_info = self._dest_info(rec)
 
+		ob_cfg        = self._gp('ob_configuration') or {}
+		fill_by_order = bool(ob_cfg.get('fill_by_order', False))
+		fill_by_item  = bool(ob_cfg.get('fill_by_item',  True))
+		max_orders    = int(ob_cfg.get('max_order_count', 30) or 30)
+		max_items     = int(ob_cfg.get('max_line_count',  300) or 300)
+
 		if fill_by_order:
-			order_count = int(chute_info.get('order_count_total', 0) or 0)
-			if order_count >= chute_capacity:
+			order_cnt = int(chute_info.get('order_count_total', 0) or 0)
+			if order_cnt >= max_orders:
 				return True
 
 		if fill_by_item:
-			item_count = int(chute_info.get('item_count_total', 0) or 0)
-			if item_count >= chute_capacity:
+			item_cnt = int(chute_info.get('item_count_total', 0) or 0)
+			if item_cnt >= max_items:
 				return True
+
+		# Physical sensor full flag (UC5.2 premature-full warning)
+		if bool(chute_info.get('chute_full', False)):
+			return True
 
 		return False
 
-	def _ob_assign_order(self, ibn_info):
+	def _ob_assign_order(self, dest_key, ibn_info):
 		"""
-		UC3.1 — Returns the OB chute dest_key for a given order, enforcing the
-		rule that an order cannot be split across multiple OB chutes.
-
-		Returns dest_key (str) or None if no OB chute is available.
+		UC3.1 — Registers an order in an OB chute and updates occupancy counts.
+		Returns True on success, False if UC3.1 would be violated.
 		"""
-		order_number = str(ibn_info.get('order_number') or '')
+		order_number = str(ibn_info.get('order_number') or '').strip()
+		sort_code    = str(ibn_info.get('consol_subzone') or '').strip()
+		ibns         = ibn_info.get('ibns') or []
+		expected_cnt = int(ibn_info.get('expected_count', 0) or 0)
+		priority     = str(ibn_info.get('priority') or '').strip()
 
-		# Honor existing OB chute assignment for order
-		if order_number:
-			for dest_key, rec in self._destination_contents.items():
+		if not order_number:
+			self.logger.warn('_ob_assign_order: called with no order_number for dest=%s' % dest_key)
+			return False
+
+		# UC3.1 — reject if the order is already homed in a DIFFERENT OB chute
+		for dk, rec in self._destination_contents.items():
+			if rec is None:
+				continue
+			if dk == dest_key:
+				continue
+			if str(rec.get('chute_type', '')).upper() != 'OB':
+				continue
+			ci = self._dest_info(rec)
+			existing = [
+				str(o.get('order_number') or '').strip()
+				for o in (ci.get('orders') or [])
+				if isinstance(o, dict)
+			]
+			if order_number in existing:
+				self.logger.warn(
+					'_ob_assign_order: UC3.1 split rejected — '
+					'order=%s already in OB chute=%s, cannot assign to %s'
+					% (order_number, dk, dest_key)
+				)
+				return False
+
+		# Load current chute state
+		dest_rec   = self.destination_get(dest_key) or {}
+		chute_info = self._dest_info(dest_rec)
+		orders     = list(chute_info.get('orders') or [])
+
+		existing_order_numbers = [
+			str(o.get('order_number') or '').strip()
+			for o in orders
+			if isinstance(o, dict)
+		]
+
+		if order_number in existing_order_numbers:
+			# Order already registered — only increment item count for this IBN
+			item_cnt = int(chute_info.get('item_count_total', 0) or 0) + 1
+			self.destination_update(dest_key, item_count_total=item_cnt)
+			self._ob_write_display_tags(dest_key)
+			return True
+
+		# Register new order in this OB chute
+		orders.append({
+			'order_number':  order_number,
+			'sort_code':     sort_code,
+			'ibns':          ibns,
+			'expected_count': expected_cnt,
+			'priority':      priority,
+		})
+
+		order_cnt = int(chute_info.get('order_count_total', 0) or 0) + 1
+		item_cnt  = int(chute_info.get('item_count_total',  0) or 0) + 1
+		line_cnt  = int(chute_info.get('line_count_total',  0) or 0) + expected_cnt
+
+		updates = dict(
+			orders            = orders,
+			order_count_total = order_cnt,
+			item_count_total  = item_cnt,
+			line_count_total  = line_cnt,
+			occupied          = True,
+			available         = False,
+		)
+
+		if not dest_rec.get('first_item_delivered_ts'):
+			updates['first_item_delivered_ts'] = system.date.now()
+
+		self.destination_update(dest_key, **updates)
+		self._ob_write_display_tags(dest_key)
+
+		self.log_event('OB',
+			reason='_ob_assign_order dest=%s order=%s sort_code=%s order_cnt=%d'
+			       % (dest_key, order_number, sort_code, order_cnt),
+			destination=dest_key, code=20,
+		)
+		return True
+
+	def ob_release(self, dest_key):
+		"""
+		UC5.1, UC5.3 — Operator-triggered OB chute release.
+
+		Eligibility check (UC5.3): for every order currently registered in
+		the OB chute there must be at least one eligible consolidation
+		destination available
+
+		If all orders can be satisfied, calls _ob_release_assign_all_orders
+		to pre-assign consolidation destinations immediately (UC5.4) to
+		prevent race conditions with new inductions.
+
+		Returns:
+		  {'ok': True,  'data': [assignments], 'message': None}   on success
+		  {'ok': False, 'data': None,          'message': reason} on failure
+		"""
+		dest_rec = self.destination_get(dest_key)
+		if dest_rec is None:
+			return {
+				'ok': False, 'data': None,
+				'message': 'ob_release: dest_key %s not found' % dest_key,
+			}
+
+		if str(dest_rec.get('chute_type', '')).upper() != 'OB':
+			return {
+				'ok': False, 'data': None,
+				'message': 'ob_release: %s is not an OB chute' % dest_key,
+			}
+
+		chute_info = self._dest_info(dest_rec)
+		orders     = chute_info.get('orders') or []
+
+		if not orders:
+			return {
+				'ok': False, 'data': None,
+				'message': 'ob_release: %s has no orders to release' % dest_key,
+			}
+
+		packout_cfg = self._gp('packout_configuration') or {}
+		max_orders  = int(packout_cfg.get('max_order_count', 2) or 2)
+
+		# UC5.3 — verify one available consolidation slot per order.
+		# Use a tentative claim set so the same slot is not double-counted.
+		ineligible       = []
+		tentative_claims = set()
+
+		for order_rec in orders:
+			if not isinstance(order_rec, dict):
+				continue
+
+			order_number = str(order_rec.get('order_number') or '').strip()
+			sort_code    = str(order_rec.get('sort_code')    or '').strip()
+			found        = False
+
+			for dk, rec in self._destination_contents.items():
 				if rec is None:
 					continue
-				if str(rec.get('chute_type', '')).upper() != 'OB':
+				if dk in tentative_claims:
+					continue
+				if str(rec.get('chute_type', '')).upper() not in CONSOLIDATION_CHUTE_TYPES:
 					continue
 				if not self._dest_is_eligible(rec):
 					continue
 
-				chute_info = self._dest_info(rec)
-				orders     = chute_info.get('orders') or []
-				if order_number in orders:
-					return dest_key
+				ci = self._dest_info(rec)
 
-		# Waterfall to chute if part of order not already in a chute
-		return self._ob_select_chute()
+				# UC9.2 — sort code conflict
+				if sort_code and self.chute_has_sort_code(dk, sort_code):
+					continue
 
-	def ob_release(self, dest_key):
-		"""UC5.1 / UC5.3 — Charles implements."""
-		raise NotImplementedError('Charles — ob_release (UC5.1, UC5.3)')
+				# Max orders per position
+				if len(ci.get('orders') or []) >= max_orders:
+					continue
+
+				tentative_claims.add(dk)
+				found = True
+				break
+
+			if not found:
+				ineligible.append(order_number)
+
+		if ineligible:
+			msg = (
+				'ob_release: %s not eligible — no consolidation slot for order(s): %s'
+				% (dest_key, ', '.join(ineligible))
+			)
+			self.logger.warn(msg)
+			return {'ok': False, 'data': None, 'message': msg}
+
+		self.log_event('OB',
+			reason='ob_release: releasing %s (%d orders)' % (dest_key, len(orders)),
+			destination=dest_key, code=21,
+		)
+
+		assignments = self._ob_release_assign_all_orders(dest_key)
+		return {'ok': True, 'data': assignments, 'message': None}
+
+	def _ob_release_assign_all_orders(self, dest_key):
+		"""
+		UC5.4 — Immediately assigns every order in the OB chute to a
+		consolidation destination to prevent race conditions with new
+		inductions at the induction scanners.
+
+		Returns a list of assignment dicts:
+		  [{'order_number': str, 'consol_dest': str | None}, ...]
+		A None consol_dest means no slot was found for that order.
+		"""
+		dest_rec   = self.destination_get(dest_key) or {}
+		chute_info = self._dest_info(dest_rec)
+		orders     = list(chute_info.get('orders') or [])
+
+		assignments  = []
+		exclude_dsts = set()   # grows as slots are claimed this pass
+
+		for order_rec in orders:
+			if not isinstance(order_rec, dict):
+				continue
+
+			order_number = str(order_rec.get('order_number') or '').strip()
+			if not order_number:
+				continue
+
+			# Reconstruct a minimal ibn_info for _find_consolidation_chute
+			ibn_info = {
+				'order_number':   order_number,
+				'consol_subzone': order_rec.get('sort_code', ''),
+				'ibns':           order_rec.get('ibns') or [],
+				'expected_count': int(order_rec.get('expected_count', 0) or 0),
+				'priority':       order_rec.get('priority', ''),
+			}
+
+			# UC9.3 path-of-least-travel; no carrier → flipper lockout skipped
+			consol_dest = self._find_consolidation_chute(
+				ibn_info,
+				carrier_number = None,
+				exclude        = exclude_dsts,
+				scanner_id     = None,
+			)
+
+			if consol_dest:
+				exclude_dsts.add(consol_dest)
+
+				# Reserve the consolidation slot immediately (UC5.4)
+				consol_rec    = self.destination_get(consol_dest) or {}
+				consol_ci     = self._dest_info(consol_rec)
+				consol_orders = list(consol_ci.get('orders') or [])
+				existing_nums = [
+					str(o.get('order_number') or '').strip()
+					for o in consol_orders if isinstance(o, dict)
+				]
+				if order_number not in existing_nums:
+					consol_orders.append({
+						'order_number': order_number,
+						'sort_code':    order_rec.get('sort_code', ''),
+					})
+					self.destination_update(consol_dest,
+						orders    = consol_orders,
+						occupied  = True,
+						available = False,
+					)
+
+				self.log_event('OB',
+					reason=(
+						'_ob_release_assign_all_orders: order=%s -> consol=%s from OB=%s'
+						% (order_number, consol_dest, dest_key)
+					),
+					destination=consol_dest, code=22,
+				)
+			else:
+				self.logger.warn(
+					'_ob_release_assign_all_orders: no consolidation chute for '
+					'order=%s from OB=%s' % (order_number, dest_key)
+				)
+
+			assignments.append({'order_number': order_number, 'consol_dest': consol_dest})
+
+		# UC5.6 — mark every carrier currently assigned to this OB chute
+		# as ob_reinducted so they never divert to OB again after re-induction.
+		reinducted = []
+		for carrier_num, carrier_rec in list(self.carriers_all().items()):
+			if not isinstance(carrier_rec, dict):
+				continue
+			if carrier_rec.get('destination') != dest_key:
+				continue
+			try:
+				self.mark_carrier_ob_reinducted(carrier_num)
+				reinducted.append(carrier_num)
+			except Exception as e:
+				self.logger.warn(
+					'_ob_release_assign_all_orders: mark_carrier_ob_reinducted '
+					'failed carrier=%s: %s' % (carrier_num, str(e))
+				)
+
+		self.log_event('OB',
+			reason=(
+				'_ob_release_assign_all_orders: OB=%s released %d orders, '
+				'reinducted %d carriers' % (dest_key, len(assignments), len(reinducted))
+			),
+			destination=dest_key, code=23,
+		)
+
+		return assignments
 
 	def _is_purge_active(self):
 		"""Returns True if the system is in purge state (UC12.1)."""
