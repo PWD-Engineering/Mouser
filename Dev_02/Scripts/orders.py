@@ -2111,6 +2111,8 @@ class Level_3_Ship_OrderRouting(
 
 		'order_aging':                     _AGING + 'order_aging',
 		'bag_dims':                        _DIMS + 'bag/dims',
+		'bag_volume_buffer_pct': 		   _DIMS + 'bag/volume_buffer_pct',
+
 	}
 
 	DEST_STATUS_TAGS = {
@@ -2894,6 +2896,89 @@ class Level_3_Ship_OrderRouting(
 				return dest
 
 		return self._max_recirc(carrier_number, ibn_info)
+	
+	# ==================================================================
+	# route_bagged_order (UC11.3)
+	# ==================================================================
+
+	def route_bagged_order(self, carrier_number, order_number, length, width, height, scanner_id=None):
+		"""
+		UC11.3
+
+		Uses scanned dimensions to calculate raw volume, applies the configured
+		buffer percent for the matching bag bracket, and returns the final
+		bag routing payload.
+		"""
+		carrier_number = int(carrier_number)
+
+		if scanner_id is not None:
+			self.scanner_id = scanner_id
+
+		order_number = str(order_number or '').strip()
+		if not order_number:
+			return None
+
+		length = _to_float(length, 0.0)
+		width  = _to_float(width, 0.0)
+		height = _to_float(height, 0.0)
+
+		raw_volume = round(length * width * height, 2)
+		if raw_volume <= 0.0:
+			return None
+
+		bag_destination = self._calculate_bag_destination(raw_volume)
+		if bag_destination is None:
+			return None
+
+		bag_dims_doc = self._gp('bag_dims', {}) or {}
+		bag_dims = bag_dims_doc.get('value', bag_dims_doc) or {}
+		bag_cfg = bag_dims.get(str(bag_destination), {}) or {}
+		buffer_pct = _to_float(bag_cfg.get('buffer_percent', 0.0), 0.0)
+
+		final_volume = round(
+			raw_volume + (raw_volume * (buffer_pct / 100.0)),
+			2
+		)
+
+		return {
+			'carrier_number': carrier_number,
+			'order_number': order_number,
+			'length': length,
+			'width': width,
+			'height': height,
+			'raw_volume': raw_volume,
+			'buffer_pct': buffer_pct,
+			'final_volume': final_volume,
+			'bag_destination': str(bag_destination),
+		}
+
+	# ==================================================================
+	# _calculate_bag_destination (UC11.4)
+	# ==================================================================
+
+	def _calculate_bag_destination(self, volume):
+		"""
+		UC11.4
+
+		Determines which bag destination bracket contains the supplied volume.
+		Returns '2', '4', '7', '9', or None.
+		"""
+		volume = _to_float(volume, 0.0)
+		if volume <= 0.0:
+			return None
+
+		bag_dims_doc = self._gp('bag_dims', {}) or {}
+		bag_dims = bag_dims_doc.get('value', bag_dims_doc) or {}
+
+		for bag_size in ('2', '4', '7', '9'):
+			cfg = bag_dims.get(bag_size) or {}
+			low_volume = _to_float(cfg.get('low_volume_in3', 0.0), 0.0)
+			upper_volume = _to_float(cfg.get('upper_volume_in3', 0.0), 0.0)
+
+			if volume >= low_volume and volume <= upper_volume:
+				return bag_size
+
+		return None
 
 	# ==================================================================
 	# _max_recirc
@@ -3582,6 +3667,7 @@ class Level_3_Ship_OrderRouting(
 		"""UC12.2 / UC12.3 — Bryor implements."""
 		raise NotImplementedError('Bryor — _route_purge (UC12.2, UC12.3)')
 
+		# UC10 — priority escalation procedure, used for UC10 functions
 	def _apply_priority_escalation(self, order_number, priority, allowed_chute_types=None):
 		priority = str(priority or '').strip().upper()
 		if priority not in ('1', '2', '3', '4', '5'):
@@ -3631,7 +3717,7 @@ class Level_3_Ship_OrderRouting(
 
 		return escalated
 
-
+		# UC10.3 & UC 10.4 — Check order status changes on scan refresh, escalate priority
 	def handle_priority_escalation(self, order_number, priority):
 		"""
 		Scanner/data-point triggered priority escalation.
@@ -3643,7 +3729,7 @@ class Level_3_Ship_OrderRouting(
 			allowed_chute_types=('NORMAL', 'OB'),
 		)
 
-
+		# UC10.1 & UC10.2 — Scan active chutes for ship deadlines, escalate priority
 	def _check_order_aging(self):
 		"""
 		Periodic priority scan.
