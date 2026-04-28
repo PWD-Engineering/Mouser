@@ -3659,6 +3659,175 @@ class Level_3_Ship_OrderRouting(
 
 		return assignments
 
+	def _ob_clear_chute(self, dest_key):
+		"""
+		UC5.5 — Flags an OB chute as available once all of its items have
+		been physically cleared (picked up and re-inducted onto the sorter).
+		"""
+		rec = self.destination_get(dest_key)
+		if rec is None:
+			self.logger.warn('_ob_clear_chute: dest_key %s not found' % dest_key)
+			return False
+
+		if str(rec.get('chute_type', '')).upper() != 'OB':
+			self.logger.warn('_ob_clear_chute: %s is not an OB chute' % dest_key)
+			return False
+
+		# UC5.5 — only clear once all items have left the chute
+		active_carriers = [
+			num for num, crec in self.carriers_all().items()
+			if isinstance(crec, dict) and crec.get('destination') == dest_key
+		]
+		if active_carriers:
+			self.logger.warn(
+				'_ob_clear_chute: %s still has %d active carrier(s) — cannot clear yet'
+				% (dest_key, len(active_carriers))
+			)
+			return False
+
+		self.clear_level3_ship_occupancy(dest_key)
+
+		# clear_level3_ship_occupancy zeros the cache; write those zeros to the OverflowBuffer display UDT so the UI reflects the cleared state.
+		self._ob_write_display_tags(dest_key)
+
+		self.log_event('OB',
+			reason='_ob_clear_chute: %s cleared and flagged available (UC5.5)' % dest_key,
+			destination=dest_key, code=24,
+		)
+		return True
+	
+	def _ob_get_eligible_chutes(self):
+		"""
+		UC5.2 — Returns all OB chutes that have content, ordered by age
+		(oldest first).  
+
+		Return value — list of dicts, sorted by age_sec descending (oldest first):
+		  {
+		    'dest_key':          str,
+		    'age_sec':           int,   # seconds since first item arrived
+		    'order_count':       int,
+		    'eligible_for_release': bool,
+		  }
+		"""
+		packout_cfg = self._gp('packout_configuration') or {}
+		max_orders  = int(packout_cfg.get('max_order_count', 2) or 2)
+
+		candidates = []
+
+		for dest_key, rec in self._destination_contents.items():
+			if rec is None:
+				continue
+			if str(rec.get('chute_type', '')).upper() != 'OB':
+				continue
+			if not self._dest_is_eligible(rec):
+				continue
+
+			chute_info = self._dest_info(rec)
+			orders     = chute_info.get('orders') or []
+			if not orders:
+				continue
+
+			# Age from first_item_delivered_ts; fall back to cached age field
+			first_ts = rec.get('first_item_delivered_ts')
+			if first_ts:
+				try:
+					age_sec = int(system.date.secondsBetween(first_ts, system.date.now()))
+				except Exception:
+					age_sec = int(chute_info.get('oldest_order_age_sec', 0) or 0)
+			else:
+				age_sec = int(chute_info.get('oldest_order_age_sec', 0) or 0)
+
+			# UC5.3 eligibility — one available consolidation slot per order,
+			# using a tentative claim set to avoid double-counting.
+			tentative_claims = set()
+			eligible         = True
+
+			for order_rec in orders:
+				if not isinstance(order_rec, dict):
+					continue
+				sort_code = str(order_rec.get('sort_code') or '').strip()
+				found     = False
+
+				for dk, drec in self._destination_contents.items():
+					if drec is None:
+						continue
+					if dk in tentative_claims:
+						continue
+					if str(drec.get('chute_type', '')).upper() not in CONSOLIDATION_CHUTE_TYPES:
+						continue
+					if not self._dest_is_eligible(drec):
+						continue
+					ci = self._dest_info(drec)
+					if sort_code and self.chute_has_sort_code(dk, sort_code):
+						continue
+					if len(ci.get('orders') or []) >= max_orders:
+						continue
+					tentative_claims.add(dk)
+					found = True
+					break
+
+				if not found:
+					eligible = False
+					break
+
+			candidates.append({
+				'dest_key':             dest_key,
+				'age_sec':              age_sec,
+				'order_count':          len(orders),
+				'eligible_for_release': eligible,
+			})
+
+		# UC5.2 — oldest chute first
+		candidates.sort(key=lambda x: x['age_sec'], reverse=True)
+		return candidates
+	
+	def _ob_age_color_state(self, dest_key):
+		"""
+		UC6.1 — Returns a gradient color state string that reflects how long
+		items have been sitting in the OB chute.
+
+		If permissive is absent, the following defaults apply:
+
+		  GREEN  — age <  1800 s  ( 30 min)  — recently filled, no concern
+		  YELLOW — age <  3600 s  ( 60 min)  — moderate age, monitor
+		  ORANGE — age <  7200 s  (120 min)  — aging, operator advisory
+		  RED    — age >= 7200 s  (120 min)  — overdue, release recommended
+
+		Returns 'NONE' when the chute has no content (age == 0).
+		"""
+		rec = self.destination_get(dest_key)
+		if rec is None:
+			return 'NONE'
+
+		chute_info = self._dest_info(rec)
+
+		first_ts = rec.get('first_item_delivered_ts')
+		if first_ts:
+			try:
+				age_sec = int(system.date.secondsBetween(first_ts, system.date.now()))
+			except Exception:
+				age_sec = int(chute_info.get('oldest_order_age_sec', 0) or 0)
+		else:
+			age_sec = int(chute_info.get('oldest_order_age_sec', 0) or 0)
+
+		if age_sec == 0:
+			return 'NONE'
+
+		ob_cfg     = self._gp('ob_configuration') or {}
+		thresholds = ob_cfg.get('age_color_thresholds_sec') or {}
+
+		t_yellow = int(thresholds.get('yellow', 1800) or 1800)
+		t_orange = int(thresholds.get('orange', 3600) or 3600)
+		t_red    = int(thresholds.get('red',    7200) or 7200)
+
+		if age_sec < t_yellow:
+			return 'GREEN'
+		if age_sec < t_orange:
+			return 'YELLOW'
+		if age_sec < t_red:
+			return 'ORANGE'
+		return 'RED'
+
 	def _is_purge_active(self):
 		"""Returns True if the system is in purge state (UC12.1)."""
 		return bool(self._gp('purge_active', False))
