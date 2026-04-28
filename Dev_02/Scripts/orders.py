@@ -3833,8 +3833,64 @@ class Level_3_Ship_OrderRouting(
 		return bool(self._gp('purge_active', False))
 
 	def _route_purge(self, carrier_number):
-		"""UC12.2 / UC12.3 — Bryor implements."""
-		raise NotImplementedError('Bryor — _route_purge (UC12.2, UC12.3)')
+		"""
+		UC12.2 / UC12.3
+
+		When purge is active, route the carrier to the first eligible PURGE
+		chute in path-of-least-travel order.
+		"""
+		carrier_number = int(carrier_number)
+
+		start_station = self._start_station_for_scanner(self.scanner_id)
+		ordered_dests = self._sorted_destinations_from(start_station)
+
+		for dest_key in ordered_dests:
+			rec = self.destination_get(dest_key)
+			if rec is None:
+				continue
+
+			if str(rec.get('chute_type', '')).upper() != 'PURGE':
+				continue
+
+			if not self._dest_is_eligible(rec):
+				continue
+
+			if not self._is_station_safe_for_carrier(dest_key, carrier_number):
+				continue
+
+			carrier_rec = self.carrier_get(carrier_number) or {}
+			transit_info = dict(carrier_rec.get('issue_info') or {})
+			transit_info['purge_active'] = True
+
+			assigned_name = (
+				carrier_rec.get('assigned_name')
+				or transit_info.get('order_number')
+				or 'PURGE'
+			)
+
+			self.assign_carrier_to_destination(
+				carrier_number  = carrier_number,
+				dest_identifier = dest_key,
+				assigned_name   = assigned_name,
+				assigned_mode   = 'PURGE',
+				transit_info    = transit_info,
+			)
+
+			self._record_station_carrier(dest_key, carrier_number)
+
+			self.log_event(
+				'Routing',
+				reason='Purge route carrier=%s to %s' % (carrier_number, dest_key),
+				ibn=transit_info.get('ibn', ''),
+				destination=dest_key,
+				code=12,
+			)
+
+			return dest_key
+
+		self.logger.warn('_route_purge: no eligible PURGE chute for carrier=%s' % carrier_number)
+		return None`
+
 
 		# UC10 — priority escalation procedure, used for UC10 functions
 	def _apply_priority_escalation(self, order_number, priority, allowed_chute_types=None):
