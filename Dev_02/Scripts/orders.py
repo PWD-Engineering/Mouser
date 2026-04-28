@@ -3827,11 +3827,13 @@ class Level_3_Ship_OrderRouting(
 		if age_sec < t_red:
 			return 'ORANGE'
 		return 'RED'
-
+	
+	# UC12.1 — Reads purge state permissive
 	def _is_purge_active(self):
 		"""Returns True if the system is in purge state (UC12.1)."""
 		return bool(self._gp('purge_active', False))
-
+	
+	# UC12.2 & UC 12.3 — When purge active, all items divert to Jackpot/Purge lanes
 	def _route_purge(self, carrier_number):
 		"""
 		UC12.2 / UC12.3
